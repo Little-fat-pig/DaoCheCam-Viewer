@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>倒车影像</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none; -webkit-user-select:none; }
+  html,body { height:100%; width:100%; background:#000; overflow:hidden; font-family:system-ui,sans-serif; touch-action:none; }
+  #cv { position:fixed; top:0; left:0; width:100vw; height:100vh; object-fit:contain; }
+  #img { position:fixed; top:0; left:0; width:100vw; height:100vh; object-fit:contain; display:none; }
+  /* 首次提示：连接成功后自动消失 */
+  #hint { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+          color:#89a; font-size:16px; letter-spacing:2px; pointer-events:none; opacity:1; transition:opacity .6s; }
+  #hint.off { opacity:0; }
+  /* 半透明齿轮：5 秒无操作自动隐藏，点击画面重新出现 */
+  #gear { position:fixed; right:14px; bottom:14px; width:44px; height:44px; border-radius:50%;
+          background:rgba(20,26,34,.55); color:#bcd; border:none; font-size:20px; line-height:44px;
+          text-align:center; cursor:pointer; transition:opacity .4s; }
+  #gear.off { opacity:0; pointer-events:none; }
+  /* 设置浮层 */
+  #panel { position:fixed; inset:0; background:rgba(8,12,18,.92); display:none; z-index:9;
+           align-items:center; justify-content:center; flex-direction:column; padding:20px; }
+  #panel.open { display:flex; }
+  #panel input { width:100%; max-width:560px; background:#1b2430; color:#eee; border:1px solid #345;
+                 border-radius:10px; padding:14px; font-size:15px; }
+  #panel .row { margin-top:14px; display:flex; gap:10px; }
+  #panel button { background:#1b2430; color:#cde; border:1px solid #345; border-radius:10px;
+                  padding:10px 22px; font-size:15px; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<img id="img" alt="">
+<div id="hint">连接摄像头…</div>
+<button id="gear" aria-label="设置">⚙</button>
+<div id="panel">
+  <input id="url" type="url" placeholder="http://192.168.43.1:8080/video" autocapitalize="off" autocorrect="off">
+  <div class="row">
+    <button id="btnSave">连接</button>
+    <button id="btnScan">自动搜索</button>
+    <button id="btnFs">全屏</button>
+    <button id="btnClose">关闭</button>
+  </div>
+</div>
+<script>
+var KEY = 'dcx_url';
+var url = localStorage.getItem(KEY) || '';
+var $ = function(id){ return document.getElementById(id); };
+$('url').value = url;
+
+var cv = $('cv'), ctx = cv.getContext('2d');
+var img = $('img'), imgMode = false;   // fetch 失败(CORS 不通)时退回 img 模式
+var timer = null, probing = false, connected = false;
+
+/* ---------- 全屏 + 横屏锁 ---------- */
+function goFull(){
+  var el = document.documentElement;
+  var req = el.requestFullscreen || el.webkitRequestFullscreen;
+  if (req && !document.fullscreenElement && !document.webkitFullscreenElement) {
+    var p = req.call(el);
+    if (p && p.then) p.then(lockLand).catch(function(){});
+    else lockLand();
+  } else lockLand();
+}
+function lockLand(){
+  try {
+    if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(function(){});
+  } catch(e){}
+}
+document.addEventListener('fullscreenchange', function(){
+  if (!document.fullscreenElement) {
+    try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch(e){}
+  }
+});
+
+/* ---------- 齿轮：5 秒无操作隐藏，点画面唤出 ---------- */
+var gearT = null;
+function armGear(){
+  clearTimeout(gearT);
+  $('gear').classList.remove('off');
+  gearT = setTimeout(function(){ $('gear').classList.add('off'); }, 5000);
+}
+document.addEventListener('click', function(e){
+  if (e.target === $('gear') || $('panel').contains(e.target)) return;
+  armGear();
+  if (!connected && !probing) (url ? play() : discover());
+  if (!document.fullscreenElement && !document.webkitFullscreenElement) goFull();
+});
+armGear();
+
+/* ---------- 设置面板 ---------- */
+$('gear').onclick = function(){ $('panel').classList.add('open'); };
+$('btnClose').onclick = function(){ $('panel').classList.remove('open'); armGear(); };
+$('btnFs').onclick = function(){ $('panel').classList.remove('open'); goFull(); };
+$('btnSave').onclick = function(){
+  var v = $('url').value.trim();
+  if (!v) return;
+  url = v; localStorage.setItem(KEY, url);
+  $('panel').classList.remove('open');
+  stop(); play();
+};
+$('btnScan').onclick = function(){
+  url = ''; localStorage.removeItem(KEY);
+  $('panel').classList.remove('open');
+  stop(); discover();
+};
+
+/* ---------- 渲染：fetch MJPEG → Canvas（丢帧保流畅）；CORS 不通退回 <img> ---------- */
+function sizeCanvas(w, h){
+  // 只按视频比例铺满窗口，避免每帧都改尺寸引起抖动
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+}
+
+function play(){
+  if (!url) { discover(); return; }
+  connected = false;
+  $('hint').classList.remove('off');
+  if (imgMode) { playImg(); return; }
+  fetchStream().catch(function(){
+    // fetch 被拦（对方服务无 CORS 头）→ 退回 img 模式
+    imgMode = true;
+    playImg();
+  });
+}
+
+function fetchStream(){
+  var ctrl;
+  return new Promise(function(resolve, reject){
+    ctrl = new AbortController();
+    var fails = setTimeout(function(){ ctrl.abort(); reject(new Error('timeout')); }, 8000);
+    fetch(url, { signal: ctrl.signal, cache: 'no-store' }).then(function(res){
+      if (!res.ok || !res.body) throw new Error('bad');
+      clearTimeout(fails);
+      var reader = res.body.getReader();
+      var buf = new Uint8Array(0);
+      var pending = null;          // 正在解码的帧（后面的帧直接丢弃 = 丢帧保流畅）
+      var JOF = [0xFF, 0xD8, 0xFF];
+
+      function findJpeg(u, from){
+        for (var i = Math.max(from, 0); i < u.length - 2; i++)
+          if (u[i] === 0xFF && u[i+1] === 0xD8 && u[i+2] === 0xFF) return i;
+        return -1;
+      }
+      function tryFrames(){
+        // 从缓冲里不断抠出完整 JPEG（按 SOI 到 EOI）
+        for (;;) {
+          var s = findJpeg(buf, 0);
+          if (s < 0) return;
+          var e = -1;
+          for (var i = s + 2; i < buf.length - 1; i++)
+            if (buf[i] === 0xFF && buf[i+1] === 0xD9) { e = i + 2; break; }
+          if (e < 0) { buf = buf.subarray(s); return; }   // 半帧：留到下次
+          var frame = buf.subarray(s, e);
+          buf = buf.subarray(e);
+          if (frame.length < 2000) continue;              // 噪声过滤
+          if (pending) continue;                          // 上一帧还没画完 → 丢帧
+          pending = true;
+          var f = frame;
+          createImageBitmap(new Blob([f], { type: 'image/jpeg' })).then(function(bmp){
+            sizeCanvas(bmp.width, bmp.height);
+            ctx.drawImage(bmp, 0, 0);
+            bmp.close();
+            if (!connected) { connected = true; $('hint').classList.add('off'); }
+            pending = false;
+          }).catch(function(){ pending = false; });
+        }
+      }
+
+      (function pump(){
+        reader.read().then(function(r){
+          if (r.done) { rejectIfNeverConnected(); return; }
+          if (r.value && r.value.length) {
+            var nv = new Uint8Array(buf.length + r.value.length);
+            nv.set(buf); nv.set(r.value, buf.length);
+            buf = nv;
+            if (buf.length > 8 * 1024 * 1024) buf = buf.subarray(buf.length - 1024 * 1024); // 防爆内存
+            tryFrames();
+          }
+          if (ctrl.signal.aborted) return;
+          pump();
+        }).catch(function(){ rejectIfNeverConnected(); });
+      })();
+
+      function rejectIfNeverConnected(){
+        if (!connected) reject(new Error('closed'));
+      }
+      resolve();
+    }).catch(function(e){ clearTimeout(fails); reject(e); });
+  });
+}
+
+/* 退路：<img> 直接播 multipart 流（浏览器自动逐帧刷新） */
+function playImg(){
+  cv.style.display = 'none';
+  img.style.display = 'block';
+  img.onload = function(){
+    if (!connected) { connected = true; $('hint').classList.add('off'); }
+  };
+  img.onerror = function(){
+    connected = false;
+    $('hint').textContent = '等待摄像头…';
+    timer = setTimeout(discover, 4000);
+  };
+  img.src = url + '?t=' + Date.now();
+}
+
+function stop(){
+  if (timer) { clearTimeout(timer); timer = null; }
+  img.src = '';
+  img.style.display = 'none';
+  cv.style.display = 'block';
+  connected = false;
+}
+
+/* ---------- 自动发现（静默，不显示过程文字） ---------- */
+function probeIp(ip, port, ms, cb){
+  var ok = false;
+  var im = new Image();
+  var t = setTimeout(function(){ if(!ok){ ok=true; im.src=''; cb(false); } }, ms);
+  im.onload = function(){ if(!ok){ ok=true; clearTimeout(t); cb(true); } };
+  im.onerror = function(){ if(!ok){ ok=true; clearTimeout(t); cb(false); } };
+  im.src = 'http://' + ip + ':' + port + '/shot.jpg?r=' + Math.random();
+}
+function candidates(){
+  var prefixes = [];
+  var m = url ? url.match(/^http:\/\/([\d.]+):(\d+)\//) : null;
+  if (m) prefixes.push(m[1].split('.').slice(0,3).join('.') + '.');
+  ['43','49','232','27','141','166'].forEach(function(p){ prefixes.push('192.168.' + p + '.'); });
+  prefixes = prefixes.filter(function(v,i,a){ return a.indexOf(v)===i; });
+  var list = [];
+  if (m) list.push({ip: m[1], port: m[2]});
+  prefixes.forEach(function(pre){
+    for (var i = 2; i <= 60; i++) { list.push({ip: pre+i, port: 8080}); list.push({ip: pre+i, port: 8081}); }
+  });
+  prefixes.forEach(function(pre){
+    for (var i = 61; i <= 254; i++) list.push({ip: pre+i, port: 8080});
+  });
+  return list.filter(function(v,i,a){ return a.findIndex(function(x){return x.ip===v.ip && x.port===v.port;})===i; });
+}
+function discover(){
+  if (probing) return;
+  probing = true;
+  connected = false;
+  $('hint').textContent = '正在搜索摄像头…';
+  var list = candidates();
+  var idx = 0, batch = 16;
+  (function next(){
+    if (idx >= list.length) {
+      probing = false;
+      $('hint').textContent = '未找到，稍后重试…（点画面可手动填地址）';
+      timer = setTimeout(discover, 5000);
+      return;
+    }
+    var bl = list.slice(idx, idx + batch);
+    idx += bl.length;
+    var done = 0;
+    bl.forEach(function(e){
+      probeIp(e.ip, e.port, 600, function(hit){
+        if (probing && hit) {
+          probing = false;
+          clearTimeout(timer);
+          url = 'http://' + e.ip + ':' + e.port + '/video';
+          localStorage.setItem(KEY, url);
+          $('url').value = url;
+          play();
+          return;
+        }
+        if (++done === bl.length) next();
+      });
+    });
+  })();
+}
+
+/* 启动 */
+if (url) play(); else discover();
+</script>
+</body>
+</html>
